@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Stack for a high-performance hashcat installation
+
+Metadata:
+  Authors:
+    Description: eikendev
+  License:
+    Description: ISC
+
+Parameters:
+  paramKeyPair:
+    Description: The key pair for connecting via SSH
+    Type: AWS::EC2::KeyPair::KeyName
+  paramVpcCIDR:
+    Description: The IP range for the VPC in CIDR-notation
+    Type: String
+    Default: 10.10.10.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: Parameter must be in the form x.x.x.x/16-28
+  paramInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: p2.xlarge
+    AllowedValues:
+      - p2.xlarge
+      - p2.8xlarge
+      - p2.16xlarge
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      ami: ami-0365f1c02d110fa96
+    us-west-2:
+      ami: ami-01242c3178ffa1b87
+    us-west-1:
+      ami: ami-08ce7082680a0d51d
+    eu-west-1:
+      ami: ami-0e13b805a2eba9cbb
+    eu-central-1:
+      ami: ami-04c35aa96c55f84e9
+    ap-southeast-1:
+      ami: ami-01789156a8f7ceeb6
+    ap-northeast-1:
+      ami: ami-052893f2b493a0e64
+    ap-southeast-2:
+      ami: ami-098efd0be56933274
+    ap-northeast-2:
+      ami: ami-086fb79ca6722fcca
+    sa-east-1:
+      ami: ami-0baa85e118a0cafcf
+    ap-south-1:
+      ami: ami-03bdd30841eeb8ecf
+
+Resources:
+  hashcatInternetGateway:
+    Type: AWS::EC2::InternetGateway
+  hashcatVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref paramVpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  hashcatVPCCidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref hashcatVPC
+      AmazonProvidedIpv6CidrBlock: true
+  hashcatVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref hashcatVPC
+      InternetGatewayId: !Ref hashcatInternetGateway
+  hashcatRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref hashcatVPC
+  hashcatRoute:
+    Type: AWS::EC2::Route
+    DependsOn: hashcatVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref hashcatRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref hashcatInternetGateway
+  hashcatRoute6:
+    Type: AWS::EC2::Route
+    DependsOn: hashcatVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref hashcatRouteTable
+      DestinationIpv6CidrBlock: '::/0'
+      GatewayId: !Ref hashcatInternetGateway
+  hashcatSubnet: # See https://stackoverflow.com/a/50111431
+    Type: AWS::EC2::Subnet
+    DependsOn: hashcatVPCCidrBlock
+    Properties:
+      VpcId: !Ref hashcatVPC
+      AvailabilityZone: !Select [ 0, !GetAZs { Ref: 'AWS::Region' } ]
+      CidrBlock: !Ref paramVpcCIDR
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt 'hashcatVPC.Ipv6CidrBlocks'], 256, 64]]
+      MapPublicIpOnLaunch: true
+      AssignIpv6AddressOnCreation: true
+  hashcatSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref hashcatRouteTable
+      SubnetId: !Ref hashcatSubnet
+  hashcatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: Security Group to allow access to the hashcat instance
+      GroupDescription: Allows inbound SSH traffic from any source
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIpv6: '::/0'
+      VpcId: !Ref hashcatVPC
+  hashcatLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref paramInstanceType
+        KeyName: !Ref paramKeyPair
+        ImageId: !FindInMap
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - ami
+        InstanceMarketOptions:
+            MarketType: spot
+            SpotOptions:
+              InstanceInterruptionBehavior: terminate
+              MaxPrice: 0.4 # TODO: Make this configurable
+              SpotInstanceType: one-time
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            SubnetId: !Ref hashcatSubnet
+            Groups:
+              - !Ref hashcatSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #cloud-config
+            repo_update: true
+            packages:
+              - build-essential
+            runcmd:
+              - touch /tmp/.cloudinit_started
+              - systemctl disable --now unattended-upgrades
+              - curl -sLo /tmp/rockyou.tgz 'https://github.com/danielmiessler/SecLists/raw/master/Passwords/Leaked-Databases/rockyou.txt.tar.gz'
+              - tar -xf /tmp/rockyou.tgz -C /opt && rm -f /tmp/rockyou.tgz
+              - curl -sLo /tmp/hashcat.tgz "$(curl -s https://api.github.com/repos/hashcat/hashcat/releases/latest | grep 'tarball_url' | awk '{print $2}' | tail -c +2 | head -c -3)"
+              - tar -xf /tmp/hashcat.tgz -C /opt && rm -f /tmp/hashcat.tgz
+              - cd /opt/hashcat-* && make -j4 && make install
+              - shutdown -P +1440
+              - touch /tmp/.cloudinit_completed
+  hashcatInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: hashcatRoute
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref hashcatLaunchTemplate
+        Version: !GetAtt hashcatLaunchTemplate.LatestVersionNumber
+
+Outputs:
+  PublicIp:
+    Description: The public IPv4 address of the hashcat instance
+    Value: !GetAtt hashcatInstance.PublicIp
